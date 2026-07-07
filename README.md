@@ -1,1 +1,1 @@
-# organikchicken-privacy-policy
+# privacy-policy
