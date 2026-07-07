@@ -1,6 +1,5 @@
 // Cloudflare Worker version of the WhatsApp FAQ bot
 // Matches incoming message text against keyword rules and replies accordingly
-// No KV / session storage — every message is replied to independently
 
 // Rules are checked top to bottom — put more specific keywords first
 const rules = [
@@ -105,14 +104,6 @@ function getReply(text) {
   return defaultReply;
 }
 
-// ============================================
-// GLOBAL PAUSE SWITCH — change to true to stop
-// ALL auto-replies, then Save and deploy.
-// Change back to false to resume.
-// (Plain code flag — no KV/storage involved)
-// ============================================
-const GLOBAL_AUTO_REPLY_ENABLED = true;
-
 export default {
   async fetch(request, env) {
     try {
@@ -124,49 +115,157 @@ export default {
   },
 };
 
+// ============================================
+// GLOBAL PAUSE SWITCH — change to true to stop
+// ALL auto-replies, then Save and deploy.
+// Change back to false to resume.
+// ============================================
+const GLOBAL_AUTO_REPLY_ENABLED = true;
+
 async function handleRequest(request, env) {
-  const url = new URL(request.url);
+    const url = new URL(request.url);
 
-  if (url.pathname !== "/webhook") {
-    return new Response("Not found", { status: 404 });
-  }
+    // --- Admin routes: pause/resume the bot for a specific customer ---
+    if (url.pathname === "/admin/pause" || url.pathname === "/admin/resume") {
+      const token = url.searchParams.get("token");
+      const number = url.searchParams.get("number");
 
-  // 1) Webhook verification (Meta calls this once, as a GET request)
-  if (request.method === "GET") {
-    const mode = url.searchParams.get("hub.mode");
-    const token = url.searchParams.get("hub.verify_token");
-    const challenge = url.searchParams.get("hub.challenge");
-
-    if (mode === "subscribe" && token === env.VERIFY_TOKEN) {
-      return new Response(challenge, { status: 200 });
-    }
-    return new Response("Forbidden", { status: 403 });
-  }
-
-  // 2) Incoming messages (POST requests)
-  if (request.method === "POST") {
-    const body = await request.json();
-
-    try {
-      const entry = body.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value = change?.value;
-      const message = value?.messages?.[0];
-
-      if (message && GLOBAL_AUTO_REPLY_ENABLED) {
-        const from = message.from;
-        const text = message.text?.body?.toLowerCase() || "";
-        const reply = getReply(text);
-        await sendMessage(env, from, reply);
+      if (token !== env.ADMIN_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
       }
-    } catch (err) {
-      console.error("Error handling webhook:", err);
+      if (!number) {
+        return new Response("Missing ?number=", { status: 400 });
+      }
+
+      if (url.pathname === "/admin/pause") {
+        // Bot stays silent for this number for up to 24h, or until /admin/resume is called
+        await env.SESSIONS.put(`agent:${number}`, "1", { expirationTtl: 60 * 60 * 24 });
+        return new Response(`Bot paused for ${number}`, { status: 200 });
+      } else {
+        await env.SESSIONS.delete(`agent:${number}`);
+        return new Response(`Bot resumed for ${number}`, { status: 200 });
+      }
     }
 
-    return new Response("OK", { status: 200 });
+    // --- Admin routes: pause/resume the bot GLOBALLY for everyone ---
+    if (url.pathname === "/admin/pause-all" || url.pathname === "/admin/resume-all") {
+      const token = url.searchParams.get("token");
+
+      if (token !== env.ADMIN_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      if (url.pathname === "/admin/pause-all") {
+        // No expirationTtl — stays off until you explicitly resume it
+        await env.SESSIONS.put("global:paused", "1");
+        return new Response("Auto-reply PAUSED for everyone", { status: 200 });
+      } else {
+        await env.SESSIONS.delete("global:paused");
+        return new Response("Auto-reply RESUMED for everyone", { status: 200 });
+      }
+    }
+
+    if (url.pathname !== "/webhook") {
+      return new Response("Not found", { status: 404 });
+    }
+
+    // 1) Webhook verification (Meta calls this once, as a GET request)
+    if (request.method === "GET") {
+      const mode = url.searchParams.get("hub.mode");
+      const token = url.searchParams.get("hub.verify_token");
+      const challenge = url.searchParams.get("hub.challenge");
+
+      if (mode === "subscribe" && token === env.VERIFY_TOKEN) {
+        return new Response(challenge, { status: 200 });
+      }
+      return new Response("Forbidden", { status: 403 });
+    }
+
+    // 2) Incoming messages (POST requests)
+    if (request.method === "POST") {
+      const body = await request.json();
+
+      // Handle the message asynchronously-ish, but still return 200 fast
+      try {
+        const entry = body.entry?.[0];
+        const change = entry?.changes?.[0];
+        const value = change?.value;
+        const message = value?.messages?.[0];
+
+        if (message) {
+          const from = message.from;
+          const text = message.text?.body?.toLowerCase() || "";
+          await handleIncomingMessage(env, from, text);
+        }
+      } catch (err) {
+        console.error("Error handling webhook:", err);
+      }
+
+      return new Response("OK", { status: 200 });
+    }
+
+    return new Response("Method not allowed", { status: 405 });
+}
+
+const MAX_AUTO_REPLIES = 3;
+const WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+const handoffMessage =
+  "আপনি আজকের জন্য সর্বোচ্চ ৩টি অটো-রিপ্লাই পেয়েছেন। এখন আমাদের একজন প্রতিনিধি শীঘ্রই সরাসরি আপনার সাথে যোগাযোগ করবেন। ধন্যবাদ ধৈর্য ধরার জন্য।";
+
+async function handleIncomingMessage(env, from, text) {
+  // Hardcoded kill switch — checked first, no KV involved
+  if (!GLOBAL_AUTO_REPLY_ENABLED) {
+    return;
   }
 
-  return new Response("Method not allowed", { status: 405 });
+  // Global kill switch (KV-based) — if paused, the bot doesn't reply to anyone
+  const globallyPaused = await env.SESSIONS.get("global:paused");
+  if (globallyPaused) {
+    return;
+  }
+
+  // If a human agent has picked up this specific conversation, stay silent
+  const agentActive = await env.SESSIONS.get(`agent:${from}`);
+  if (agentActive) {
+    return;
+  }
+
+  const key = `session:${from}`;
+  const now = Date.now();
+
+  let session = null;
+  try {
+    const raw = await env.SESSIONS.get(key);
+    if (raw) session = JSON.parse(raw);
+  } catch (err) {
+    console.error("Failed to read session:", err);
+  }
+
+  // Start a fresh 24h window if none exists or the old one expired
+  if (!session || now - session.windowStart > WINDOW_MS) {
+    session = { windowStart: now, count: 0, notified: false };
+  }
+
+  if (session.count < MAX_AUTO_REPLIES) {
+    const reply = getReply(text);
+    await sendMessage(env, from, reply);
+    session.count += 1;
+  } else if (!session.notified) {
+    // Limit just reached — send the handoff notice once per window
+    await sendMessage(env, from, handoffMessage);
+    session.notified = true;
+  }
+  // If already notified and still within the same window, stay silent —
+  // a human should take over from here (e.g. via Meta Business Suite inbox)
+
+  try {
+    await env.SESSIONS.put(key, JSON.stringify(session), {
+      expirationTtl: 60 * 60 * 24, // auto-clean after 24h
+    });
+  } catch (err) {
+    console.error("Failed to save session:", err);
+  }
 }
 
 async function sendMessage(env, to, text) {
